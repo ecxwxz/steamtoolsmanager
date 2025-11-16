@@ -1,7 +1,7 @@
 # steamtoolsmanager
 
 > 🛠 **Steam Manifest 下载器 & 自动入库工具整合版**  
-> 旨在帮助零基础用户了解 Steam 的基本运行机制，并减少重复手动操作。
+> steam假入库的配套便捷工具，完全开源，无需担心病毒。
 
 ---
 
