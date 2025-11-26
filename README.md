@@ -22,8 +22,7 @@
 
 本程序依赖于 steamtools 的相关机制进行解锁与入库，使用前请自行了解相关原理与风险。
 
-- steamtools 安装包已包含于本仓库中：  
-  👉 [steamtools 官网](https://www.steamtools.net/)
+- steamtools 安装包已包含于本仓库中：  👉 [steamtools 官网](https://www.steamtools.net/)
 
 - APP ID 的获取方式：  
   - 在 Steam 官方商店页面中，URL 里的数字部分即为该游戏的 `APPID`  
