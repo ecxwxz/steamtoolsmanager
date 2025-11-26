@@ -17,26 +17,12 @@ import threading
 import tkinter as tk
 import webbrowser
 from tkinter import ttk, messagebox
+from search import search_games
 from bs4 import BeautifulSoup
-try:
-    from PIL import Image, ImageTk, ImageFilter, ImageOps  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover - Pillow optional
-    Image = None
-    ImageTk = None
-    ImageFilter = None
-    ImageOps = None
-
+from PIL import Image, ImageTk, ImageFilter, ImageOps
 import requests
-
-try:
-    from bs4 import BeautifulSoup  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover - optional dependency
-    BeautifulSoup = None
-
-try:
-    import winreg  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - 非 Windows 系统
-    winreg = None
+from bs4 import BeautifulSoup
+import winreg
 
 
 ALLOWED_SUFFIXES: Iterable[str] = (".lua", ".manifest", ".json", ".vdf")
@@ -86,6 +72,11 @@ class SteamManifestDownloader:
         self._background_size = (0, 0)
         self.progress_animating = False
         self.current_game_folder: Optional[str] = None
+        self.search_results: list[dict[str, object]] = []
+        self.search_dropdown: tk.Toplevel | None = None
+        self.search_result_images: list[tk.PhotoImage] = []
+        self._prefetched_game: dict[str, object] | None = None
+        self._search_in_progress = False
         self._setup_background()
         self.create_widgets()
         if self.background_label is not None:
@@ -156,16 +147,15 @@ class SteamManifestDownloader:
         ttk.Label(search_frame, text="关键词:").pack(side="left", padx=(10, 5))
         self.search_entry = ttk.Entry(search_frame)
         self.search_entry.pack(side="left", fill="x", expand=True, padx=5, pady=5)
-        self.search_entry.bind(
-            "<Return>", lambda e: self.on_feature_disabled("游戏搜索")
-        )
+        self.search_entry.bind("<Return>", lambda e: self.perform_search())
 
-        ttk.Button(
+        self.search_btn = ttk.Button(
             search_frame,
             text="搜索",
-            command=lambda: self.on_feature_disabled("游戏搜索"),
+            command=self.perform_search,
             width=10,
-        ).pack(side="left", padx=5)
+        )
+        self.search_btn.pack(side="left", padx=5)
 
         # AppID 输入区域
         input_frame = ttk.Frame(self.root)
@@ -265,6 +255,189 @@ class SteamManifestDownloader:
         message = f"{feature_name} 该功能还没有开发，敬请期待！"
         self.log(message)
         messagebox.showinfo("功能不可用", message)
+
+    def perform_search(self):
+        term = self.search_entry.get().strip()
+        if not term:
+            messagebox.showinfo("搜索", "请输入关键词")
+            return
+        if self._search_in_progress:
+            return
+        self._search_in_progress = True
+        self.search_btn.configure(state="disabled")
+        self._hide_search_dropdown()
+        threading.Thread(
+            target=self._run_search_in_background, args=(term,), daemon=True
+        ).start()
+
+    def _run_search_in_background(self, term: str):
+        try:
+            results = search_games(term, limit=10)
+        except Exception as exc:  # noqa: BLE001
+            self._enqueue_log(f"搜索失败：{exc}")
+            self.root.after(
+                0,
+                lambda: (
+                    messagebox.showerror("错误", f"搜索失败：{exc}"),
+                    self._finish_search([]),
+                ),
+            )
+            return
+
+        enriched: list[dict[str, object]] = []
+        for item in results:
+            appid = str(item.get("appid") or "")
+            image_url = item.get("image") or ""
+            image_data = self._download_image_bytes(image_url) if image_url else None
+            enriched.append(
+                {
+                    "name": item.get("name") or "",
+                    "appid": appid,
+                    "image": image_url,
+                    "image_data": image_data,
+                }
+            )
+        self.root.after(0, lambda: self._finish_search(enriched))
+
+    def _finish_search(self, results: list[dict[str, object]]):
+        self._search_in_progress = False
+        self.search_btn.configure(state="normal")
+        self.search_results = results
+        if not results:
+            messagebox.showinfo("提示", "请输入游戏关键字")
+            return
+        self._show_search_dropdown(results)
+
+    def _show_search_dropdown(self, results: list[dict[str, object]]):
+        self._hide_search_dropdown()
+        self.search_dropdown = tk.Toplevel(self.root)
+        self.search_dropdown.overrideredirect(True)
+        self.search_dropdown.attributes("-topmost", True)
+
+        container = ttk.Frame(
+            self.search_dropdown, padding=4, relief="solid", borderwidth=1
+        )
+        container.pack(fill="both", expand=True)
+
+        row_height = 68
+        style = ttk.Style(self.search_dropdown)
+        style.configure("Search.Treeview", rowheight=row_height, font=("Microsoft YaHei", 10))
+        style.configure(
+            "Search.Treeview.Heading", padding=(6, 6), font=("Microsoft YaHei", 10, "bold")
+        )
+
+        columns = ("appid",)
+        visible_rows = max(1, min(len(results), 5))
+        tree = ttk.Treeview(
+            container,
+            columns=columns,
+            show="tree headings",
+            selectmode="browse",
+            height=visible_rows,
+            style="Search.Treeview",
+        )
+        tree.heading("#0", text="游戏")
+        tree.heading("appid", text="AppID")
+        tree.column("#0", width=260)
+        tree.column("appid", width=100, anchor="center")
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        self.search_result_images = []
+        for idx, item in enumerate(results):
+            photo = self._make_search_thumbnail(
+                item.get("image_data"), item.get("image")
+            )
+            self.search_result_images.append(photo)
+            tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                text=item.get("name", ""),
+                image=photo,
+                values=(item.get("appid", ""),),
+            )
+
+        tree.bind("<Double-1>", lambda e: self._on_select_search_result(tree))
+        tree.bind("<Return>", lambda e: self._on_select_search_result(tree))
+        tree.focus_set()
+
+        def close_on_focus_out(event):
+            if self.search_dropdown and event.widget is not self.search_dropdown:
+                self._hide_search_dropdown()
+
+        self.search_dropdown.bind("<FocusOut>", close_on_focus_out)
+        self.search_dropdown.bind("<Escape>", lambda e: self._hide_search_dropdown())
+
+        self.root.update_idletasks()
+        x = self.search_entry.winfo_rootx()
+        y = self.search_entry.winfo_rooty() + self.search_entry.winfo_height()
+        width = max(self.search_entry.winfo_width(), 380)
+        heading_height = 32
+        padding = 16  # container padding + borders
+        height = row_height * visible_rows + heading_height + padding
+        self.search_dropdown.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _on_select_search_result(self, tree: ttk.Treeview):
+        selection = tree.selection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        if idx >= len(self.search_results):
+            self._hide_search_dropdown()
+            return
+        data = self.search_results[idx]
+        appid = str(data.get("appid") or "")
+        name = data.get("name") or None
+        image_url = data.get("image") or None
+        image_data = data.get("image_data")
+
+        self.appid_entry.delete(0, tk.END)
+        self.appid_entry.insert(0, appid)
+        folder_name = self._sanitize_filename(name) if name else appid
+        self._prefetched_game = {
+            "appid": appid,
+            "name": name,
+            "header_url": image_url,
+            "image_data": image_data,
+            "folder_name": folder_name,
+        }
+        self._apply_game_info_to_ui(name, image_url, image_data, folder_name)
+        self._hide_search_dropdown()
+
+    def _hide_search_dropdown(self):
+        if self.search_dropdown is not None:
+            try:
+                self.search_dropdown.destroy()
+            except tk.TclError:
+                pass
+        self.search_dropdown = None
+        self.search_result_images = []
+
+    def _make_search_thumbnail(
+        self, image_data: bytes | None, image_url: str | None
+    ) -> tk.PhotoImage | None:
+        if image_data is None and image_url:
+            image_data = self._download_image_bytes(image_url)
+        if image_data and Image is not None and ImageTk is not None:
+            try:
+                image = Image.open(io.BytesIO(image_data))
+                image.thumbnail((90, 45), Image.LANCZOS)
+                return ImageTk.PhotoImage(image)
+            except OSError:
+                pass
+        if image_data:
+            try:
+                encoded = base64.b64encode(image_data)
+                return tk.PhotoImage(data=encoded)
+            except tk.TclError:
+                return None
+        return None
 
     def open_settings_window(self):
         settings_window = tk.Toplevel(self.root)
@@ -390,7 +563,13 @@ class SteamManifestDownloader:
         self.current_task.start()
 
     def _background_job(self, source: str, appid: str):
-        name, header_url, image_data, folder_name = self._collect_game_info(appid)
+        if self._prefetched_game and self._prefetched_game.get("appid") == appid:
+            name = self._prefetched_game.get("name")
+            header_url = self._prefetched_game.get("header_url")
+            image_data = self._prefetched_game.get("image_data")
+            folder_name = self._prefetched_game.get("folder_name") or appid
+        else:
+            name, header_url, image_data, folder_name = self._collect_game_info(appid)
         self.root.after(
             0,
             lambda: self._apply_game_info_to_ui(
