@@ -11,6 +11,7 @@ import json
 from typing import Dict, List, Optional
 
 import requests
+import urllib3
 
 
 STEAM_SEARCH_API = "https://store.steampowered.com/api/storesearch/"
@@ -20,6 +21,9 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
+
+# Disable TLS verification warnings; calls below explicitly skip verification.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def _is_ascii(text: str) -> bool:
@@ -41,6 +45,7 @@ def _translate_to_english(term: str) -> Optional[str]:
             translate_api.format(requests.utils.quote(term)),
             headers=DEFAULT_HEADERS,
             timeout=10,
+            verify=False,
         )
         response.raise_for_status()
         data = response.json()
@@ -58,7 +63,11 @@ def _fetch_store(term: str, language: str, country: str) -> List[Dict[str, objec
         "cc": country,
     }
     response = requests.get(
-        STEAM_SEARCH_API, params=params, timeout=15, headers=DEFAULT_HEADERS
+        STEAM_SEARCH_API,
+        params=params,
+        timeout=15,
+        headers=DEFAULT_HEADERS,
+        verify=False,
     )
     response.raise_for_status()
     payload = response.json()
