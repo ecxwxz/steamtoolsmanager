@@ -55,8 +55,14 @@ class SteamManifestDownloader:
         self.auto_import = tk.BooleanVar(
             value=self.settings.get("auto_import", False)
         )
+        self.search_enhance = tk.BooleanVar(
+            value=self.settings.get("search_enhance", False)
+        )
         self.auto_import_status = tk.StringVar(
             value="开启" if self.auto_import.get() else "关闭"
+        )
+        self.search_enhance_status = tk.StringVar(
+            value="开启" if self.search_enhance.get() else "关闭"
         )
         self.current_task: threading.Thread | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -89,6 +95,11 @@ class SteamManifestDownloader:
         self.root.minsize(width, height)
         self.root.resizable(False, False)
         self.log_area.configure(state="disabled")
+        # 在程序日志中显示更新信息（大字体标题 + 版本 + 简短说明）
+        try:
+            self._show_update_banner()
+        except Exception:
+            pass
         self.root.after(100, self._process_log_queue)
 
     def _setup_background(self):
@@ -221,6 +232,7 @@ class SteamManifestDownloader:
         bottom_frame = ttk.Frame(self.root)
         bottom_frame.pack(fill="x", padx=10, pady=5)
 
+
         ttk.Button(
             bottom_frame,
             text="打开下载目录",
@@ -272,7 +284,9 @@ class SteamManifestDownloader:
 
     def _run_search_in_background(self, term: str):
         try:
-            results = search_games(term, limit=10)
+            results = search_games(
+                term, limit=10, translate_fallback=self.search_enhance.get()
+            )
         except Exception as exc:  # noqa: BLE001
             self._enqueue_log(f"搜索失败：{exc}")
             self.root.after(
@@ -304,7 +318,7 @@ class SteamManifestDownloader:
         self.search_btn.configure(state="normal")
         self.search_results = results
         if not results:
-            messagebox.showinfo("提示", "请输入游戏关键字")
+            messagebox.showinfo("提示", "未找到结果")
             return
         self._show_search_dropdown(results)
 
@@ -482,6 +496,22 @@ class SteamManifestDownloader:
             foreground="#1a73e8",
         ).pack(side="right")
 
+        search_frame = ttk.LabelFrame(settings_window, text="搜索增强")
+        search_frame.pack(fill="x", padx=15, pady=10)
+        search_row = ttk.Frame(search_frame)
+        search_row.pack(fill="x", padx=10, pady=5)
+        ttk.Checkbutton(
+            search_row,
+            text="搜索增强（需要魔法）",
+            variable=self.search_enhance,
+            command=self.toggle_search_enhance,
+        ).pack(side="left")
+        ttk.Label(
+            search_row,
+            textvariable=self.search_enhance_status,
+            foreground="#1a73e8",
+        ).pack(side="right")
+
         ttk.Button(
             settings_window,
             text="关闭",
@@ -509,7 +539,7 @@ class SteamManifestDownloader:
         except Exception as exc:  # pragma: no cover - GUI feedback
             self.log(f"打开官网失败：{exc}")
             messagebox.showerror("错误", f"无法打开官网：{exc}")
-        settings_window.resizable(False, False)
+        # noop - keep settings window size behavior handled above
 
     def set_download_source(self, value: str):
         self.download_source.set(value)
@@ -525,6 +555,13 @@ class SteamManifestDownloader:
         self.log(f"自动入库功能{state}")
         self.auto_import_status.set("开启" if self.auto_import.get() else "关闭")
         self.settings["auto_import"] = self.auto_import.get()
+        self.save_settings()
+
+    def toggle_search_enhance(self):
+        state = "已开启" if self.search_enhance.get() else "已关闭"
+        self.log(f"搜索增强{state}")
+        self.search_enhance_status.set("开启" if self.search_enhance.get() else "关闭")
+        self.settings["search_enhance"] = self.search_enhance.get()
         self.save_settings()
 
     def open_download_folder(self):
@@ -593,8 +630,16 @@ class SteamManifestDownloader:
 
         if success and self.auto_import.get():
             self._enqueue_log("下载完成，开始自动入库...")
-            if self._auto_import_lua(appid):
+            auto_ok = False
+            try:
+                auto_ok = self._auto_import_lua(appid)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._enqueue_log(f"自动入库失败：{exc}")
+                auto_ok = False
+            if auto_ok:
                 self._enqueue_log("自动入库完成。")
+            else:
+                self._enqueue_log("自动入库未完成。")
         if success:
             self._enqueue_log("任务完成。")
         else:
@@ -658,11 +703,14 @@ class SteamManifestDownloader:
         except RuntimeError as exc:
             self._enqueue_log(str(exc))
             return False
+        else:
+            # 成功后以一句话报告：下载完成并保留文件至目标目录（避免显示临时压缩包路径）
+            self._enqueue_log(f"下载完成，保留的文件已保存至 {target_dir}")
         finally:
+            # 尝试删除临时压缩包，但不将压缩包路径作为常规日志输出，除非删除失败
             if os.path.exists(zip_path):
                 try:
                     os.remove(zip_path)
-                    self._enqueue_log(f"清理临时压缩包：{zip_path}")
                 except OSError as exc:
                     self._enqueue_log(f"无法删除压缩包 {zip_path}: {exc}")
         return True
@@ -696,7 +744,6 @@ class SteamManifestDownloader:
                 self._enqueue_log(f"移动 {file_path} -> {dest} 失败: {exc}")
 
         shutil.rmtree(staging_dir, ignore_errors=True)
-        self._enqueue_log(f"解压完成，保留的文件已保存至 {target_root}")
 
     def _check_domestic_url(self, url: str) -> bool:
         try:
@@ -721,13 +768,50 @@ class SteamManifestDownloader:
         try:
             with requests.get(url, headers=headers, stream=True, timeout=timeout) as resp:
                 resp.raise_for_status()
+
+                # 尝试读取总长度（字节）以便显示百分比进度
+                total_bytes = 0
+                try:
+                    total_bytes = int(resp.headers.get("content-length") or 0)
+                except (TypeError, ValueError):
+                    total_bytes = 0
+
+                # 如果知道总长度，切换到确定模式并按百分比更新；否则保留不确定动画
+                if total_bytes > 0:
+                    def _switch_to_determinate():
+                        if self.progress_animating:
+                            try:
+                                self.progress_bar.stop()
+                            except Exception:
+                                pass
+                            self.progress_animating = False
+                        self.progress_bar.configure(mode="determinate")
+                        self.progress_var.set(0)
+
+                    self.root.after(0, _switch_to_determinate)
+
+                downloaded = 0
                 with open(save_path, "wb") as file_handle:
                     for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            file_handle.write(chunk)
-            self._enqueue_log(f"下载完成：{save_path}")
+                        if not chunk:
+                            continue
+                        file_handle.write(chunk)
+                        if total_bytes > 0:
+                            downloaded += len(chunk)
+                            percent = min(100.0, downloaded * 100.0 / total_bytes)
+                            # 在主线程更新 UI
+                            self.root.after(0, lambda p=percent: self.progress_var.set(p))
+
+            # 确保进度显示为 100%
+            self.root.after(0, lambda: self.progress_var.set(100))
+            # 不再记录压缩包路径的下载完成信息，解压完成后将统一一条日志报告
             return True
         except requests.RequestException as exc:
+            # 下载失败时将进度设置回 0 并记录错误
+            try:
+                self.root.after(0, lambda: self.progress_var.set(0))
+            except Exception:
+                pass
             self._enqueue_log(f"下载失败：{exc}")
             return False
 
@@ -843,6 +927,32 @@ class SteamManifestDownloader:
                 log_file.write(f"[{stamp}] {message}\n")
         except OSError:
             pass
+
+    def _show_update_banner(self):
+        """在日志面板中以大字显示更新日志（标题、版本、内容）。"""
+        if not hasattr(self, "log_area") or self.log_area is None:
+            return
+        # 允许写入、插入并恢复只读
+        try:
+            self.log_area.configure(state="normal")
+            # 设置样式标签
+            try:
+                self.log_area.tag_configure("update_title", font=("Microsoft YaHei", 16, "bold"))
+                self.log_area.tag_configure("update_version", font=("Microsoft YaHei", 12, "bold"))
+            except Exception:
+                # 如果字体不可用或其他问题，忽略样式设置
+                pass
+
+            # 插入更新内容
+            self.log_area.insert("end", "更新日志\n", ("update_title",))
+            self.log_area.insert("end", "版本号:1.2\n", ("update_version",))
+            self.log_area.insert("end", "细化了设置选项，解决了一些bug\n\n")
+            self.log_area.see("end")
+        finally:
+            try:
+                self.log_area.configure(state="disabled")
+            except Exception:
+                pass
 
     def _collect_game_info(self, appid: str) -> tuple[str | None, str | None, bytes | None, str]:
         name = None
@@ -1015,12 +1125,13 @@ class SteamManifestDownloader:
                     return json.load(f)
             except (json.JSONDecodeError, OSError):
                 pass
-        return {"download_source": "domestic", "auto_import": False}
+        return {"download_source": "domestic", "auto_import": False, "search_enhance": False}
 
     def save_settings(self):
         data = {
             "download_source": self.download_source.get(),
             "auto_import": self.auto_import.get(),
+            "search_enhance": self.search_enhance.get(),
         }
         with open("config.json", "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
