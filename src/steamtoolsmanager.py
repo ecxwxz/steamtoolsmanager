@@ -27,6 +27,9 @@ import winreg
 
 ALLOWED_SUFFIXES: Iterable[str] = (".lua", ".manifest", ".json", ".vdf")
 NODE_TIMEOUT = 1
+SEGMENT_MIN_BYTES = 2 * 1024 * 1024
+SEGMENT_WORKERS = 4
+SEGMENT_CHUNK_SIZE = 8192
 STEAM_ENV_KEYS = ("STEAM_PATH", "SteamPath", "STEAMPATH")
 DEFAULT_STEAM_PATHS = (
     r"C:\Program Files (x86)\Steam",
@@ -81,8 +84,11 @@ class SteamManifestDownloader:
         self.search_results: list[dict[str, object]] = []
         self.search_dropdown: tk.Toplevel | None = None
         self.search_result_images: list[tk.PhotoImage] = []
+        self._search_tree: ttk.Treeview | None = None
+        self._search_image_task_id = 0
         self._prefetched_game: dict[str, object] | None = None
         self._search_in_progress = False
+        self._image_request_id = 0
         self._setup_background()
         self.create_widgets()
         if self.background_label is not None:
@@ -302,13 +308,12 @@ class SteamManifestDownloader:
         for item in results:
             appid = str(item.get("appid") or "")
             image_url = item.get("image") or ""
-            image_data = self._download_image_bytes(image_url) if image_url else None
             enriched.append(
                 {
                     "name": item.get("name") or "",
                     "appid": appid,
                     "image": image_url,
-                    "image_data": image_data,
+                    "image_data": None,
                 }
             )
         self.root.after(0, lambda: self._finish_search(enriched))
@@ -362,18 +367,15 @@ class SteamManifestDownloader:
         container.rowconfigure(0, weight=1)
         container.columnconfigure(0, weight=1)
 
-        self.search_result_images = []
+        self._search_tree = tree
+        self.search_result_images = [None] * len(results)
         for idx, item in enumerate(results):
-            photo = self._make_search_thumbnail(
-                item.get("image_data"), item.get("image")
-            )
-            self.search_result_images.append(photo)
             tree.insert(
                 "",
                 "end",
                 iid=str(idx),
                 text=item.get("name", ""),
-                image=photo,
+                image="",
                 values=(item.get("appid", ""),),
             )
 
@@ -396,6 +398,64 @@ class SteamManifestDownloader:
         padding = 16  # container padding + borders
         height = row_height * visible_rows + heading_height + padding
         self.search_dropdown.geometry(f"{width}x{height}+{x}+{y}")
+        self._start_search_image_loading(tree, results)
+
+    def _start_search_image_loading(
+        self, tree: ttk.Treeview, results: list[dict[str, object]]
+    ) -> None:
+        # Load thumbnails in parallel to reduce perceived latency while keeping the UI free.
+        task_id = self._search_image_task_id + 1
+        self._search_image_task_id = task_id
+
+        def worker():
+            max_workers = max(1, min(8, len(results)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(self._build_search_photo, idx, item): idx
+                    for idx, item in enumerate(results)
+                }
+                for future in as_completed(future_map):
+                    if task_id != self._search_image_task_id or self._search_tree is not tree:
+                        break
+                    try:
+                        idx, photo = future.result()
+                    except Exception:
+                        continue
+                    if photo is None:
+                        continue
+                    self.search_result_images[idx] = photo
+
+                    def update(i=idx, p=photo):
+                        if (
+                            task_id != self._search_image_task_id
+                            or self._search_tree is not tree
+                            or self.search_dropdown is None
+                            or not tree.winfo_exists()
+                        ):
+                            return
+                        try:
+                            tree.item(str(i), image=p)
+                        except tk.TclError:
+                            pass
+
+                    self.root.after(0, update)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_search_photo(
+        self, idx: int, item: dict[str, object]
+    ) -> tuple[int, tk.PhotoImage | None]:
+        image_data = item.get("image_data")
+        if image_data is None:
+            image_url = item.get("image") or ""
+            if image_url:
+                image_data = self._download_image_bytes(image_url)
+        if not image_data:
+            return idx, None
+
+        item["image_data"] = image_data
+        photo = self._make_search_thumbnail(image_data, item.get("image"))
+        return idx, photo
 
     def _on_select_search_result(self, tree: ttk.Treeview):
         selection = tree.selection()
@@ -432,6 +492,8 @@ class SteamManifestDownloader:
                 pass
         self.search_dropdown = None
         self.search_result_images = []
+        self._search_tree = None
+        self._search_image_task_id += 1
 
     def _make_search_thumbnail(
         self, image_data: bytes | None, image_url: str | None
@@ -649,7 +711,7 @@ class SteamManifestDownloader:
 
     def _handle_domestic_download(self, appid: str, folder_name: str, download_root: str) -> bool:
         base_url = (
-            "https://proxy.pipers.cn/https://github.com/SteamAutoCracks/ManifestHub"
+            "https://gh.llkk.cc/https://github.com/SteamAutoCracks/ManifestHub"
             f"/archive/refs/heads/{appid}.zip"
         )
         zip_path = os.path.join(download_root, f"{appid}.zip")
@@ -746,15 +808,28 @@ class SteamManifestDownloader:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
     def _check_domestic_url(self, url: str) -> bool:
+        # Fast probe to avoid downloading the entire archive during health check.
         try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 404:
-                self._enqueue_log("国内源未收录该游戏的资源，请尝试切换到国外源。")
+            resp = requests.head(url, timeout=(5, 5), allow_redirects=True)
+            if resp.status_code == 404:
+                self._enqueue_log("Domestic source missing this game, try overseas source")
                 return False
-            response.raise_for_status()
+            resp.raise_for_status()
             return True
+        except requests.RequestException:
+            pass
+
+        try:
+            headers = {"Range": "bytes=0-0"}
+            with requests.get(url, headers=headers, stream=True, timeout=(5, 5)) as resp:
+                if resp.status_code == 404:
+                    self._enqueue_log("Domestic source missing this game, try overseas source")
+                    return False
+                resp.raise_for_status()
+                resp.raw.read(1)
+                return True
         except requests.RequestException as exc:
-            self._enqueue_log(f"国内源连接失败：{exc}")
+            self._enqueue_log(f"Domestic source check failed: {exc}")
             return False
 
     def _download_file_stream(
@@ -764,57 +839,173 @@ class SteamManifestDownloader:
         headers: dict | None = None,
         timeout: float | tuple[float, float] = 30,
     ) -> bool:
-        self._enqueue_log(f"开始下载...")
+        self._enqueue_log("Start downloading...")
+        req_headers = headers.copy() if headers else {}
+        total_bytes = 0
+        supports_ranges = False
+
+        try:
+            try:
+                head_resp = requests.head(url, headers=req_headers, timeout=10)
+                head_resp.raise_for_status()
+                total_bytes = int(head_resp.headers.get("content-length") or 0)
+                supports_ranges = (
+                    head_resp.headers.get("accept-ranges", "").lower() == "bytes"
+                )
+            except (requests.RequestException, ValueError, TypeError):
+                total_bytes = 0
+
+            if total_bytes > 0:
+                self.root.after(0, self._set_progress_to_determinate)
+
+            if supports_ranges and total_bytes >= SEGMENT_MIN_BYTES:
+                self._enqueue_log("Using parallel segmented download to speed up")
+                ok = self._download_with_segments(
+                    url, save_path, total_bytes, req_headers, timeout
+                )
+                if ok:
+                    self.root.after(0, lambda: self.progress_var.set(100))
+                    return True
+                self._enqueue_log("Segmented download failed, falling back to single stream")
+
+            ok = self._download_single_stream(
+                url, save_path, req_headers, timeout, total_bytes
+            )
+            if ok:
+                self.root.after(0, lambda: self.progress_var.set(100))
+            return ok
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.root.after(0, lambda: self.progress_var.set(0))
+            except Exception:
+                pass
+            self._enqueue_log(f"Download failed: {exc}")
+            return False
+
+    def _download_single_stream(
+        self,
+        url: str,
+        save_path: str,
+        headers: dict[str, str],
+        timeout: float | tuple[float, float],
+        total_bytes: int,
+    ) -> bool:
         try:
             with requests.get(url, headers=headers, stream=True, timeout=timeout) as resp:
                 resp.raise_for_status()
 
-                # 尝试读取总长度（字节）以便显示百分比进度
-                total_bytes = 0
-                try:
-                    total_bytes = int(resp.headers.get("content-length") or 0)
-                except (TypeError, ValueError):
-                    total_bytes = 0
-
-                # 如果知道总长度，切换到确定模式并按百分比更新；否则保留不确定动画
-                if total_bytes > 0:
-                    def _switch_to_determinate():
-                        if self.progress_animating:
-                            try:
-                                self.progress_bar.stop()
-                            except Exception:
-                                pass
-                            self.progress_animating = False
-                        self.progress_bar.configure(mode="determinate")
-                        self.progress_var.set(0)
-
-                    self.root.after(0, _switch_to_determinate)
+                if total_bytes <= 0:
+                    try:
+                        total_bytes = int(resp.headers.get("content-length") or 0)
+                    except (TypeError, ValueError):
+                        total_bytes = 0
+                    if total_bytes > 0:
+                        self.root.after(0, self._set_progress_to_determinate)
 
                 downloaded = 0
+                last_percent = 0.0
                 with open(save_path, "wb") as file_handle:
-                    for chunk in resp.iter_content(chunk_size=8192):
+                    for chunk in resp.iter_content(chunk_size=SEGMENT_CHUNK_SIZE):
                         if not chunk:
                             continue
                         file_handle.write(chunk)
                         if total_bytes > 0:
                             downloaded += len(chunk)
                             percent = min(100.0, downloaded * 100.0 / total_bytes)
-                            # 在主线程更新 UI
-                            self.root.after(0, lambda p=percent: self.progress_var.set(p))
-
-            # 确保进度显示为 100%
-            self.root.after(0, lambda: self.progress_var.set(100))
-            # 不再记录压缩包路径的下载完成信息，解压完成后将统一一条日志报告
+                            if percent - last_percent >= 1 or downloaded == total_bytes:
+                                last_percent = percent
+                                self.root.after(
+                                    0, lambda p=percent: self.progress_var.set(p)
+                                )
             return True
-        except requests.RequestException as exc:
-            # 下载失败时将进度设置回 0 并记录错误
-            try:
-                self.root.after(0, lambda: self.progress_var.set(0))
-            except Exception:
-                pass
-            self._enqueue_log(f"下载失败：{exc}")
+        except (requests.RequestException, OSError) as exc:
+            self._enqueue_log(f"Download failed: {exc}")
             return False
 
+    def _download_with_segments(
+        self,
+        url: str,
+        save_path: str,
+        total_bytes: int,
+        headers: dict[str, str],
+        timeout: float | tuple[float, float],
+    ) -> bool:
+        segment_count = max(
+            1, min(SEGMENT_WORKERS, math.ceil(total_bytes / SEGMENT_MIN_BYTES))
+        )
+        segment_size = math.ceil(total_bytes / segment_count)
+        part_paths: list[str | None] = [None] * segment_count
+        progress_lock = threading.Lock()
+        downloaded = 0
+        last_percent = 0.0
+
+        def cleanup_parts():
+            for path_str in part_paths:
+                if path_str and os.path.exists(path_str):
+                    try:
+                        os.remove(path_str)
+                    except OSError:
+                        pass
+
+        def download_part(idx: int, start: int, end: int) -> bool:
+            nonlocal downloaded, last_percent
+            part_headers = dict(headers)
+            part_headers["Range"] = f"bytes={start}-{end}"
+            part_path = f"{save_path}.part{idx}"
+            try:
+                with requests.get(
+                    url, headers=part_headers, stream=True, timeout=timeout
+                ) as resp:
+                    resp.raise_for_status()
+                    status_ok = resp.status_code == 206 or (
+                        resp.status_code == 200 and start == 0 and end >= total_bytes - 1
+                    )
+                    if not status_ok:
+                        return False
+                    with open(part_path, "wb") as part_file:
+                        for chunk in resp.iter_content(chunk_size=SEGMENT_CHUNK_SIZE):
+                            if not chunk:
+                                continue
+                            part_file.write(chunk)
+                            with progress_lock:
+                                downloaded += len(chunk)
+                                percent = min(100.0, downloaded * 100.0 / total_bytes)
+                                if percent - last_percent >= 1 or downloaded == total_bytes:
+                                    last_percent = percent
+                                    self.root.after(
+                                        0, lambda p=percent: self.progress_var.set(p)
+                                    )
+                part_paths[idx] = part_path
+                return True
+            except (requests.RequestException, OSError):
+                return False
+
+        with ThreadPoolExecutor(max_workers=segment_count) as executor:
+            futures = []
+            for idx in range(segment_count):
+                start = idx * segment_size
+                end = min(total_bytes - 1, start + segment_size - 1)
+                futures.append(executor.submit(download_part, idx, start, end))
+
+            all_ok = all(f.result() for f in futures)
+
+        if not all_ok or any(path is None for path in part_paths):
+            cleanup_parts()
+            return False
+
+        try:
+            with open(save_path, "wb") as target:
+                for path_str in part_paths:
+                    if path_str is None:
+                        return False
+                    with open(path_str, "rb") as part_file:
+                        shutil.copyfileobj(part_file, target, SEGMENT_CHUNK_SIZE * 2)
+        except OSError:
+            cleanup_parts()
+            return False
+
+        cleanup_parts()
+        return True
     def _find_first_valid_node(self, appid: str, total_nodes: int = 6) -> int | None:
         with ThreadPoolExecutor(max_workers=total_nodes) as executor:
             future_map = {
@@ -988,8 +1179,39 @@ class SteamManifestDownloader:
     ):
         self.game_name_var.set(f"游戏名称：{name}" if name else "游戏名称：未知")
         self.header_image_url = header_url
-        self._update_game_image(header_url, image_data)
+        self._image_request_id += 1
+        current_request = self._image_request_id
         self.current_game_folder = folder_name
+
+        if image_data is not None:
+            self._update_game_image(header_url, image_data)
+            return
+
+        # Avoid blocking UI when image is still loading; fetch asynchronously.
+        self.game_image.configure(image="", text="图片加载中..." if header_url else "图片预览")
+        self.game_image_photo = None
+        if not header_url:
+            return
+
+        threading.Thread(
+            target=self._download_and_set_image,
+            args=(header_url, current_request),
+            daemon=True,
+        ).start()
+        self.current_game_folder = folder_name
+
+    def _download_and_set_image(self, header_url: str, request_id: int):
+        image_data = self._download_image_bytes(header_url)
+
+        def apply():
+            if request_id != self._image_request_id:
+                return
+            if image_data:
+                self._update_game_image(header_url, image_data)
+            else:
+                self.game_image.configure(text=f"图片：{header_url}", image="")
+
+        self.root.after(0, apply)
 
     def _fetch_game_info(self, appid: str) -> tuple[str | None, str | None]:
         url = "https://store.steampowered.com/api/appdetails"
@@ -1098,6 +1320,16 @@ class SteamManifestDownloader:
         except tk.TclError as exc:
             self.log(f"图片无法显示：{exc}")
             self.game_image.configure(text=f"图片：{header_url}", image="")
+
+    def _set_progress_to_determinate(self):
+        if self.progress_animating:
+            try:
+                self.progress_bar.stop()
+            except Exception:
+                pass
+            self.progress_animating = False
+        self.progress_bar.configure(mode="determinate")
+        self.progress_var.set(0)
 
     def _start_progress_animation(self):
         if self.progress_animating:
